@@ -22,7 +22,7 @@ tests/fixtures/real_world/colorme*
 # Conversion outputs (re-runnable from .pdf source)
 tests/fixtures/real_world/*.md
 # AI & editor tool directories
-.claude
+.claude/
 .cursor/
 .windsurf/
 .vscode/

@@ -56,17 +56,20 @@ Powered by **pdfplumber** (Python) running inside **Pyodide** (WebAssembly). Sam
 ### Project structure
 
 ```
-extension-pyodide/
-├── manifest.json          # MV3, Chrome 116+
-├── popup.html / popup.js  # Extension UI
-├── offscreen.html / offscreen.js  # Pyodide runtime
-├── background.js          # Service worker
-├── python/
-│   └── converter.py       # PDF → Markdown logic
-├── lib/
-│   ├── pyodide/           # Pyodide core (~12 MB)
-│   └── wheels/            # Pre-bundled Python packages (~7 MB)
-└── icons/
+pdf-to-md/
+├── extension-pyodide/
+│   ├── manifest.json          # MV3, Chrome 116+
+│   ├── popup.html / popup.js / popup.css  # Extension UI
+│   ├── offscreen.html / offscreen.js      # Pyodide runtime
+│   ├── background.js          # Service worker
+│   ├── python/
+│   │   └── converter.py       # PDF → Markdown logic
+│   ├── lib/
+│   │   ├── pyodide/           # Pyodide core (~12 MB)
+│   │   └── wheels/            # Pre-bundled Python packages (~7 MB)
+│   └── icons/
+└── tests/
+    └── test_converter.py      # pytest tests for converter.py
 ```
 
 ---
