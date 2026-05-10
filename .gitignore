@@ -1,0 +1,23 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.coverage
+dist/
+build/
+.DS_Store
+
+# Auto-generated test fixtures (rebuilt via tests/fixtures/*.py)
+tests/fixtures/sample_*.pdf
+tests/fixtures/sample_*.md
+
+# Cached real-world PDFs (re-downloaded by tests/real_world/run_benchmark.py)
+tests/fixtures/real_world/arxiv_*
+tests/fixtures/real_world/berkshire_*
+tests/fixtures/real_world/irs_*
+tests/fixtures/real_world/rfc*
+tests/fixtures/real_world/colorme*
+
+# Conversion outputs (re-runnable from .pdf source)
+tests/fixtures/real_world/*.md

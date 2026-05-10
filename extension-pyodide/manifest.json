@@ -1,0 +1,40 @@
+{
+  "manifest_version": 3,
+  "name": "PDF to MD",
+  "version": "0.1.0",
+  "description": "PDF → Markdown chạy Python pdfplumber thật trong browser qua Pyodide. 100% local, quality cao như backend Python.",
+  "permissions": ["activeTab", "offscreen", "downloads", "storage"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "host_permissions": ["<all_urls>"],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "PDF to MD",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
+  },
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "lib/pyodide/*",
+        "lib/wheels/*",
+        "python/*",
+        "offscreen.html",
+        "offscreen.js"
+      ],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}
