@@ -4,6 +4,31 @@ const $ = (id) => document.getElementById(id);
 const status = (msg) => ($("status").textContent = msg);
 const PDF_RE = /\.pdf(?:[?#]|$)/i;
 
+let converting = false;
+let progressTimer = null;
+let progressPct = 0;
+
+function startFakeProgress() {
+  progressPct = 0;
+  status("Converting… 0%");
+  progressTimer = setInterval(() => {
+    if (progressPct < 95) status(`Converting… ${++progressPct}%`);
+  }, 500);
+}
+
+function stopFakeProgress() {
+  if (progressTimer) { clearInterval(progressTimer); progressTimer = null; }
+}
+
+function setConverting(active) {
+  converting = active;
+  const btn = $("convert");
+  btn.disabled = active;
+  btn.setAttribute("aria-disabled", String(active));
+  if (active) btn.setAttribute("aria-busy", "true");
+  else btn.removeAttribute("aria-busy");
+}
+
 // ===== Filename detection =====
 const UUID_RE = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
 const isUuidLike = (s) => !s || UUID_RE.test(s);
@@ -129,8 +154,9 @@ function handleResult({ markdown, filename, pages, tables }, sendResponse) {
   a.click();
   setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(blobUrl); }, 1000);
   if (currentTabId) chrome.storage.session.remove(`stem_${currentTabId}`).catch(() => {});
-  status(`Done: ${pages} trang, ${tables} bảng, ${markdown.length.toLocaleString()} ký tự.`);
-  $("convert").disabled = false;
+  stopFakeProgress();
+  status(`Done — ${pages} pages, ${tables} tables, ${markdown.length.toLocaleString()} chars.`);
+  setConverting(false);
   sendResponse({ ok: true });
 }
 
@@ -140,15 +166,17 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   switch (msg.type) {
     case "progress": status(msg.message); break;
     case "ready":
-      status("Sẵn sàng.");
+      status("Ready.");
       $("convert").disabled = false;
+      $("convert").setAttribute("aria-disabled", "false");
       break;
     case "result":
       handleResult(msg, sendResponse);
       return true;
     case "error":
-      status(`Lỗi: ${msg.message}`);
-      $("convert").disabled = false;
+      stopFakeProgress();
+      status(`Error: ${msg.message}`);
+      if (converting) setConverting(false);
       break;
   }
   return false;
@@ -176,36 +204,38 @@ async function init() {
   if (displayStem) saveCachedStem(currentTabId, displayStem);
   $("filename").textContent = displayStem
     ? `${displayStem}.pdf`
-    : "(auto: domain-date — sẽ tinh chỉnh sau fetch)";
+    : "(auto-detected after fetch)";
 
   const isPdf = await detectIsPdf(url);
   if (!isPdf) {
-    status("Tab hiện tại không phải PDF.");
+    status("Current tab is not a PDF.");
     return;
   }
 
-  // Đảm bảo offscreen đang chạy
   chrome.runtime.sendMessage({ type: "ensure-offscreen" });
 
-  // Kiểm tra Pyodide đã sẵn sàng chưa (nếu đã load từ lần trước)
-  status("Đang kiểm tra Python runtime...");
+  status("Checking Python runtime…");
   try {
     const resp = await chrome.runtime.sendMessage({ target: "offscreen", type: "get-status" });
     if (resp?.ready) {
-      status("Sẵn sàng.");
+      status("Ready.");
       $("convert").disabled = false;
+      $("convert").setAttribute("aria-disabled", "false");
     } else {
-      status("Đang load Python runtime...");
+      status("Loading Python runtime…");
     }
   } catch {
-    status("Đang load Python runtime...");
+    status("Loading Python runtime…");
   }
 
   $("convert").addEventListener("click", async () => {
-    $("convert").disabled = true;
+    setConverting(true);
+    const controller = new AbortController();
+    const fetchTimeout = setTimeout(() => controller.abort(), 120_000);
     try {
-      status("Đang tải PDF...");
-      const resp = await fetch(url);
+      status("Fetching PDF…");
+      const resp = await fetch(url, { signal: controller.signal });
+      clearTimeout(fetchTimeout);
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
 
       if (!displayStem) {
@@ -221,7 +251,7 @@ async function init() {
       for (let i = 0; i < bytes.length; i += 8192) {
         binary += String.fromCharCode.apply(null, bytes.subarray(i, i + 8192));
       }
-      status("Đang convert (Python)...");
+      startFakeProgress();
       chrome.runtime.sendMessage({
         target: "offscreen",
         type: "convert",
@@ -229,8 +259,11 @@ async function init() {
         filename: `${ensureValidStem(displayStem)}.md`,
       });
     } catch (e) {
-      status(`Lỗi: ${e.message}`);
-      $("convert").disabled = false;
+      clearTimeout(fetchTimeout);
+      stopFakeProgress();
+      const msg = e.name === "AbortError" ? "Fetch timed out (>2 min)." : e.message;
+      status(`Error: ${msg}`);
+      setConverting(false);
     }
   });
 }

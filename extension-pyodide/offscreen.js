@@ -17,13 +17,13 @@ function broadcast(msg) {
 
 async function init() {
   try {
-    broadcast({ target: "popup", type: "progress", message: "Đang load Python runtime (~12MB)..." });
+    broadcast({ target: "popup", type: "progress", message: "Loading… 10%" });
     pyodide = await loadPyodide({ indexURL: URL_BASE + "lib/pyodide/" });
 
-    broadcast({ target: "popup", type: "progress", message: "Đang load cryptography + cffi + pillow..." });
+    broadcast({ target: "popup", type: "progress", message: "Loading… 50%" });
     await pyodide.loadPackage(PYODIDE_PACKAGES);
 
-    broadcast({ target: "popup", type: "progress", message: "Đang cài pdfplumber + pdfminer.six..." });
+    broadcast({ target: "popup", type: "progress", message: "Loading… 75%" });
     try { pyodide.FS.mkdirTree("/tmp/wheels"); } catch (_) {}
     const emfsPaths = [];
     for (const w of CUSTOM_WHEELS) {
@@ -38,14 +38,14 @@ import micropip
 await micropip.install(list(_wheels), deps=False)
 `);
 
-    broadcast({ target: "popup", type: "progress", message: "Đang load converter Python..." });
+    broadcast({ target: "popup", type: "progress", message: "Loading… 90%" });
     const code = await fetch(URL_BASE + "python/converter.py").then((r) => r.text());
     pyodide.runPython(code);
 
     ready = true;
     broadcast({ target: "popup", type: "ready" });
   } catch (e) {
-    broadcast({ target: "popup", type: "error", message: e.message });
+    broadcast({ target: "popup", type: "error", message: `Failed to initialize: ${e.message}` });
   }
 }
 
@@ -59,7 +59,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   if (msg.type === "convert") {
     if (!ready) {
-      broadcast({ target: "popup", type: "error", message: "Pyodide chưa sẵn sàng." });
+      broadcast({ target: "popup", type: "error", message: "Python runtime not ready yet." });
       return false;
     }
     (async () => {
@@ -88,7 +88,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           });
         }
       } catch (e) {
-        broadcast({ target: "popup", type: "error", message: e.message });
+        let errMsg = e.message || "Unknown error";
+        if (/PdfReadError|PDFSyntax|PDFEncryption|PdfStreamError/i.test(errMsg)) {
+          errMsg = "Failed to parse PDF — may be encrypted or corrupted.";
+        } else if (/MemoryError/i.test(errMsg)) {
+          errMsg = "Out of memory — PDF may be too large.";
+        }
+        broadcast({ target: "popup", type: "error", message: errMsg });
       }
     })();
     return false;

@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "PDF to MD",
   "version": "0.1.0",
-  "description": "PDF → Markdown chạy Python pdfplumber thật trong browser qua Pyodide. 100% local, quality cao như backend Python.",
+  "description": "Convert PDF to Markdown — 100% local, no uploads, your files stay private.",
   "permissions": ["activeTab", "offscreen", "downloads", "storage"],
   "background": {
     "service_worker": "background.js"

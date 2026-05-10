@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="vi">
+<html lang="en">
 <head>
   <meta charset="UTF-8" />
   <title>PDF to MD</title>
@@ -8,16 +8,16 @@
 <body>
   <header>
     <h1>PDF to MD</h1>
-    <p class="tag">Python pdfplumber thật trong browser · 100% local</p>
+    <p class="tag">Runs 100% locally · No uploads · Your files stay private</p>
   </header>
 
   <main>
     <div id="info">
       <div class="row"><span class="label">File:</span> <span id="filename">—</span></div>
-      <div class="row"><span class="label">Trạng thái:</span> <span id="status">Đang load Python runtime...</span></div>
+      <div class="row"><span class="label">Status:</span> <span id="status" aria-live="polite" aria-atomic="true">Loading Python runtime…</span></div>
     </div>
 
-    <button id="convert" disabled>Tải dưới dạng .md</button>
+    <button id="convert" disabled aria-disabled="true">Download as .md</button>
   </main>
 
   <footer>
