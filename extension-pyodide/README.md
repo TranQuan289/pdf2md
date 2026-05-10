@@ -1,95 +1,112 @@
-# convert-md (Pyodide variant)
+# PDF to MD — Chrome Extension
 
-Chrome extension chạy **Python pdfplumber thật** trong browser qua Pyodide (CPython compile sang WebAssembly). 100% local, không upload — quality tương đương backend Python.
+Convert any PDF tab to Markdown, entirely inside your browser.  
+Chuyển đổi PDF sang Markdown ngay trong trình duyệt, không cần server.
 
-## So sánh với extension JS
+---
 
-| | `extension/` (JS) | `extension-pyodide/` (Python) |
+## English
+
+### What it does
+
+Opens a PDF tab in Chrome → click the extension → downloads a `.md` file. No files leave your machine.
+
+Powered by **pdfplumber** (Python) running inside **Pyodide** (WebAssembly). Same conversion quality as a Python backend.
+
+### Features
+
+- 100% local — no uploads, no servers, no account required
+- Extracts text, headings, bullet lists, numbered lists, tables
+- Multi-column layout reordering
+- Page number / header / footer filtering
+- Complex tables rendered as HTML (`colspan`, `rowspan`)
+- Multilingual: Latin, Vietnamese, Chinese, Japanese, Korean
+
+### Install (Developer Mode)
+
+1. Go to `chrome://extensions/`
+2. Enable **Developer mode** (top-right toggle)
+3. Click **Load unpacked** → select the `extension-pyodide/` folder
+4. Open any PDF tab → click the extension icon → **Download as .md**
+
+> First load takes 5–8 seconds (Pyodide initialising). Subsequent opens are instant.
+
+### Requirements
+
+- Chrome 116 or later
+
+### Bundle size
+
+~22 MB. Breakdown:
+
+| Component | Size | Purpose |
 |---|---|---|
-| Engine | PDF.js + heuristics tự viết | **pdfplumber thật** (Python + pdfminer.six) |
-| Bundle | ~2.9MB | **~21MB** |
-| Startup | <1s | 3-8s lần đầu (cache sau) |
-| Quality | ~80% | **~95%** (= Python backend) |
-| Maintenance | Tôi maintain JS port | Update pdfplumber là tự động hưởng |
+| `pyodide.asm.wasm` | 8.3 MB | Python interpreter (WebAssembly) |
+| `pdfminer_six.whl` | 6.3 MB | PDF parsing engine |
+| `python_stdlib.zip` | 2.3 MB | Python standard library |
+| `pyodide.asm.js` | 1.0 MB | JS ↔ WASM glue |
+| Everything else | ~4 MB | Dependencies |
 
-→ Chọn `extension-pyodide/` nếu cần quality cao và không quan tâm bundle size.
-→ Chọn `extension/` nếu muốn bundle nhẹ + startup nhanh, chấp nhận quality thấp hơn.
+### Limitations
 
-## Cài đặt (developer mode)
+- **No OCR** — scanned/image-only PDFs produce no text
+- **No SVG/diagrams** — visual elements are skipped
+- **Encrypted PDFs** — not supported; shows an error message
 
-1. `chrome://extensions/`
-2. Bật **Developer mode**
-3. **Load unpacked** → chọn thư mục `extension-pyodide/`
-4. Lần đầu mở popup mất 5-8s để load Pyodide — sau đó cache, lần sau nhanh
-
-## Cấu trúc
+### Project structure
 
 ```
 extension-pyodide/
-├── manifest.json              # MV3 + CSP cho WASM
-├── popup.{html,css,js}
-├── lib/
-│   ├── pyodide/               # Pyodide 0.29.4 core (~12MB)
-│   │   ├── pyodide.mjs
-│   │   ├── pyodide.asm.wasm   # Python interpreter compile sang WASM
-│   │   ├── pyodide.asm.js
-│   │   ├── python_stdlib.zip  # Python stdlib
-│   │   └── pyodide-lock.json
-│   └── wheels/                # Pre-bundled .whl (~9MB)
-│       ├── pdfminer_six-*.whl
-│       ├── pdfplumber-0.10.4.whl
-│       ├── charset_normalizer-*.whl
-│       ├── cryptography-*.whl
-│       ├── cffi-*.whl
-│       ├── pycparser-*.whl
-│       └── pillow-*.whl
+├── manifest.json          # MV3, Chrome 116+
+├── popup.html / popup.js  # Extension UI
+├── offscreen.html / offscreen.js  # Pyodide runtime
+├── background.js          # Service worker
 ├── python/
-│   └── converter.py           # Logic Python — port từ src/convertmd/
+│   └── converter.py       # PDF → Markdown logic
+├── lib/
+│   ├── pyodide/           # Pyodide core (~12 MB)
+│   └── wheels/            # Pre-bundled Python packages (~7 MB)
 └── icons/
 ```
 
-## Flow hoạt động
+---
 
-```
-User click extension icon
-  ↓
-popup.js bootstrap:
-  1. loadPyodide() ← load WASM + Python stdlib
-  2. micropip.install(các wheel local)
-  3. fetch(converter.py) → pyodide.runPython()
-  ↓
-User click "Tải dưới dạng .md"
-  ↓
-fetch(currentTabUrl) → arrayBuffer → bytes
-  ↓
-pyodide.runPython("convert(bytes)"):
-  1. pdfplumber.open(io.BytesIO(bytes))
-  2. Cho mỗi page: extract chars + tables
-  3. Filter page-number artifacts
-  4. Reorder columns (multi-column logic)
-  5. Build markdown (heading/list/table)
-  ↓
-Blob → anchor[download] click → .md file
-```
+## Tiếng Việt
 
-## Lưu ý kỹ thuật
+### Chức năng
 
-- **CSP cho WASM**: manifest có `script-src 'self' 'wasm-unsafe-eval'` để Chrome cho phép Pyodide chạy.
-- **Wheels offline**: tất cả `.whl` bundle local — không cần network sau khi cài extension.
-- **pymupdf KHÔNG dùng** vì chưa có WASM build trong Pyodide. Chỉ dùng pdfplumber + pdfminer.six (đều pure Python). Vẫn cover được hầu hết tính năng.
-- **Service worker không cần** — popup tự handle hết (Pyodide chạy trong popup context, mỗi lần mở popup load lại WASM, browser cache giữa lần).
+Mở tab PDF trong Chrome → bấm vào extension → tải file `.md` về máy. Toàn bộ xử lý diễn ra cục bộ, không có byte nào rời khỏi máy tính của bạn.
 
-## Tested
+Sử dụng **pdfplumber** (Python) chạy bên trong **Pyodide** (WebAssembly) — chất lượng chuyển đổi tương đương backend Python thực sự.
 
-| PDF | Pyodide ext | Python convertmd | Match |
-|---|---|---|---|
-| sample_table.pdf | 1 table 4×3, "# Pricing Table" | giống | ✅ |
-| Đồ án Việt 90 trang | 39 tables, 78K chars | 39 tables, 76K chars | ~95% |
-| arXiv | (chưa test) | 8 tables | TBD |
+### Tính năng
 
-## Limitation
+- 100% cục bộ — không upload, không server, không cần tài khoản
+- Trích xuất văn bản, tiêu đề, danh sách, bảng biểu
+- Tự động sắp xếp lại bố cục nhiều cột
+- Lọc số trang, header, footer
+- Bảng phức tạp được render HTML (`colspan`, `rowspan`)
+- Đa ngôn ngữ: Latin, Tiếng Việt, Trung, Nhật, Hàn
 
-- **Bundle to**: ~21MB extension. Lần đầu mở mất 5-8s.
-- **PyMuPDF không có**: heading detection có thể kém precision so với Python convertmd vì pdfplumber chỉ cho size/font ở char level (đủ dùng nhưng không có font flag bold detection chính xác bằng PyMuPDF).
-- **OCR không có**: pytesseract cần binary tesseract → không port được sang WASM.
-- **First load slow**: Pyodide download + init mất vài giây. Cache giữa lần OK.
+### Cài đặt (Developer Mode)
+
+1. Mở `chrome://extensions/`
+2. Bật **Developer mode** (góc trên bên phải)
+3. Bấm **Load unpacked** → chọn thư mục `extension-pyodide/`
+4. Mở tab PDF bất kỳ → bấm icon extension → **Download as .md**
+
+> Lần đầu mở mất 5–8 giây để Pyodide khởi động. Các lần sau nhanh hơn nhờ cache.
+
+### Yêu cầu
+
+- Chrome 116 trở lên
+
+### Giới hạn
+
+- **Không có OCR** — PDF scan (toàn hình ảnh) sẽ không trích xuất được text
+- **Không xử lý SVG/biểu đồ** — bỏ qua các thành phần đồ họa
+- **PDF mã hoá** — không hỗ trợ, sẽ hiện thông báo lỗi
+
+---
+
+with ❤ by **[Poji](https://www.facebook.com/po.jii01)**

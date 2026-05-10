@@ -83,3 +83,6 @@ footer {
 }
 
 footer strong { color: #0ea5e9; }
+
+footer a { color: inherit; text-decoration: none; }
+footer a:hover { text-decoration: none; }
