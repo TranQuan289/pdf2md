@@ -455,6 +455,205 @@ def _render_table(rows):
     return "\n".join(out)
 
 
+# ===== HTML table rendering (for complex tables with colspan/rowspan) =====
+
+def _grid_bounds(tbl):
+    """Collect sorted unique x/y boundaries from all cell bboxes."""
+    cells = [c for row in tbl.rows for c in row.cells if c is not None]
+    xs = sorted({round(v) for c in cells for v in (c[0], c[2])})
+    ys = sorted({round(v) for c in cells for v in (c[1], c[3])})
+    return xs, ys
+
+
+def _snap_idx(val, bounds):
+    v = round(val)
+    return min(range(len(bounds)), key=lambda i: abs(bounds[i] - v))
+
+
+def _cell_spans(bbox, xs, ys):
+    x0, y0, x1, y1 = bbox
+    c0 = _snap_idx(x0, xs)
+    c1 = _snap_idx(x1, xs)
+    r0 = _snap_idx(y0, ys)
+    r1 = _snap_idx(y1, ys)
+    return r0, c0, max(1, r1 - r0), max(1, c1 - c0)
+
+
+def _is_complex_table(tbl):
+    """Return True if any cell has colspan or rowspan > 1."""
+    try:
+        xs, ys = _grid_bounds(tbl)
+        for row in tbl.rows:
+            for cell in row.cells:
+                if cell is None:
+                    return True  # rowspan-covered cell
+                _, _, rs, cs = _cell_spans(cell, xs, ys)
+                if rs > 1 or cs > 1:
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+def _render_html_table(tbl, extracted, page, blank_boxes):
+    """Render a complex table as HTML with colspan/rowspan.
+
+    Also handles two common PDF artifacts:
+    - Phantom columns: empty columns from PDF grid lines → removed from output
+    - Text boxes: bordered rectangles with 1 real column → rendered as single-column table
+    - Blank answer boxes: small bordered squares within text → wrapped with | markers
+
+    Falls back to Markdown on any error.
+    """
+    try:
+        xs, ys = _grid_bounds(tbl)
+        n_rows = max(1, len(ys) - 1)
+        n_cols = max(1, len(xs) - 1)
+
+        # grid[r][c] = {"text", "cs", "rs"} | "x" (span-occupied) | None
+        grid = [[None] * n_cols for _ in range(n_rows)]
+
+        for r_phys, tbl_row in enumerate(tbl.rows):
+            ex_row = extracted[r_phys] if r_phys < len(extracted) else []
+            for c_phys, cell in enumerate(tbl_row.cells):
+                if cell is None:
+                    continue
+                r0, c0, rs, cs = _cell_spans(cell, xs, ys)
+                if not (0 <= r0 < n_rows and 0 <= c0 < n_cols):
+                    continue
+
+                x0, y0, x1, y1 = cell
+                text = (ex_row[c_phys] if c_phys < len(ex_row) else None) or ""
+
+                # Apply blank-box markers when any answer box overlaps this cell
+                if blank_boxes:
+                    overlap = [b for b in blank_boxes
+                               if b[0] < x1 and b[2] > x0 and b[1] < y1 and b[3] > y0]
+                    if overlap:
+                        try:
+                            cell_chars = page.crop((x0, y0, x1, y1)).chars
+                            cell_lines = _chars_to_lines(cell_chars)
+                            cell_lines = _apply_blank_markers(cell_lines, overlap)
+                            text = " ".join(
+                                ln["text"].strip() for ln in cell_lines if ln["text"].strip()
+                            )
+                        except Exception:
+                            pass
+
+                grid[r0][c0] = {"text": text.strip(), "cs": cs, "rs": rs}
+                for rr in range(r0, min(r0 + rs, n_rows)):
+                    for cc in range(c0, min(c0 + cs, n_cols)):
+                        if rr != r0 or cc != c0:
+                            grid[rr][cc] = "x"
+
+        # Majority-based phantom column detection.
+        # A cs=1 non-empty cell anchors its column as real.
+        # Otherwise, ≥80% empty non-x cells → phantom.
+        phantom_cols = set()
+        for c in range(n_cols):
+            col_cells = [grid[r][c] for r in range(n_rows)]
+            if any(isinstance(cell, dict) and cell["text"] and cell["cs"] == 1
+                   for cell in col_cells):
+                continue
+            non_x = [cell for cell in col_cells if cell != "x"]
+            if not non_x:
+                phantom_cols.add(c)
+                continue
+            empty = sum(1 for cell in non_x
+                        if cell is None or (isinstance(cell, dict) and not cell["text"]))
+            if empty / len(non_x) >= 0.8:
+                phantom_cols.add(c)
+
+        non_phantom = [c for c in range(n_cols) if c not in phantom_cols]
+        non_empty_cols = [c for c in non_phantom if any(
+            isinstance(grid[r][c], dict) and grid[r][c]["text"]
+            for r in range(n_rows)
+        )]
+
+        def esc(s):
+            return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+        # Text box: only 1 non-empty column (e.g. bordered reading passage).
+        # Render as a simple single-column table preserving the visual border.
+        if len(non_empty_cols) == 1:
+            tc = non_empty_cols[0]
+            out = ["<table>"]
+            for r in range(n_rows):
+                cell = grid[r][tc]
+                if isinstance(cell, dict) and cell["text"]:
+                    out.append(f"<tr><td>{esc(cell['text'])}</td></tr>")
+            out.append("</table>")
+            return "\n".join(out)
+
+        # Detect structural columns: non-phantom cols that appear as span anchors
+        # (cs>1) in some rows but never have independent (cs=1) content.
+        # In such columns, rows with empty cs=1 cells are alignment artifacts
+        # caused by colspan cells in other row groups → merge into adjacent cell.
+        structural_cols = set()
+        for c in non_phantom:
+            has_cs1 = any(
+                isinstance(grid[r][c], dict) and grid[r][c]["text"] and grid[r][c]["cs"] == 1
+                for r in range(n_rows)
+            )
+            has_span = any(
+                isinstance(grid[r][c], dict) and grid[r][c]["text"] and grid[r][c]["cs"] > 1
+                for r in range(n_rows)
+            )
+            if not has_cs1 and has_span:
+                structural_cols.add(c)
+
+        for r in range(n_rows):
+            for c in range(n_cols - 1):
+                if c not in structural_cols:
+                    continue
+                cell = grid[r][c]
+                if not (isinstance(cell, dict) and not cell["text"] and cell["cs"] == 1):
+                    continue
+                nc = c + 1
+                while nc < n_cols and nc in phantom_cols:
+                    nc += 1
+                if nc >= n_cols or not isinstance(grid[r][nc], dict):
+                    continue
+                next_cell = grid[r][nc]
+                if next_cell["text"] and cell["rs"] == next_cell["rs"]:
+                    grid[r][c] = {"text": next_cell["text"], "cs": nc - c + next_cell["cs"], "rs": next_cell["rs"]}
+                    grid[r][nc] = "x"
+
+        # Full table: skip phantom columns, adjust colspan to exclude them.
+        out = ["<table>"]
+        for r in range(n_rows):
+            row = grid[r]
+            has_content = any(
+                isinstance(row[c], dict) and (c not in phantom_cols or row[c]["text"])
+                for c in range(n_cols)
+            )
+            if not has_content:
+                continue
+            out.append("<tr>")
+            for c, cell in enumerate(row):
+                if cell is None or cell == "x":
+                    continue
+                if c in phantom_cols and not cell["text"]:
+                    continue
+                effective_cs = sum(
+                    1 for cc in range(c, c + cell["cs"]) if cc not in phantom_cols
+                )
+                if effective_cs <= 0:
+                    effective_cs = 1
+                attrs = ""
+                if effective_cs > 1:
+                    attrs += f' colspan="{effective_cs}"'
+                if cell["rs"] > 1:
+                    attrs += f' rowspan="{cell["rs"]}"'
+                out.append(f'  <td{attrs}>{esc(cell["text"])}</td>')
+            out.append("</tr>")
+        out.append("</table>")
+        return "\n".join(out)
+
+    except Exception:
+        return _render_table(extracted)
+
+
 def _line_inside_any_bbox(line, bboxes):
     cx = (line["x0"] + line["x1"]) / 2
     cy = (line["top"] + line["bottom"]) / 2
@@ -472,18 +671,32 @@ def convert(pdf_bytes):
         all_chars = []
 
         for page in pdf.pages:
-            blank_boxes = _detect_blank_boxes(page)
+            raw_blank_boxes = _detect_blank_boxes(page)
             chars = _filter_vertical_chars(page.chars, page.height)
             all_chars.extend(chars)
             lines = _chars_to_lines(chars)
             lines = _filter_page_artifacts(lines, page.height)
-            lines = _apply_blank_markers(lines, blank_boxes)
 
             try:
                 pdfp_tables = page.find_tables(table_settings=TABLE_SETTINGS)
                 pdfp_tables = _filter_nested_tables(pdfp_tables)
             except Exception:
                 pdfp_tables = []
+
+            # Filter blank boxes: remove those that are table cell borders.
+            # Small rectangles detected inside table bboxes are cell borders, not answer blanks.
+            tbl_regions = [tbl.bbox for tbl in pdfp_tables]
+            blank_boxes = [
+                b for b in raw_blank_boxes
+                if not any(
+                    b[0] >= tr[0] - 1 and b[2] <= tr[2] + 1
+                    and b[1] >= tr[1] - 1 and b[3] <= tr[3] + 1
+                    for tr in tbl_regions
+                )
+            ]
+
+            lines = _apply_blank_markers(lines, blank_boxes)
+
             tables = []
             table_bboxes = []
             for tbl in pdfp_tables:
@@ -496,7 +709,8 @@ def convert(pdf_bytes):
                 rows = [[(c or "").strip() for c in r] for r in rows]
                 if not any(any(c for c in r) for r in rows):
                     continue
-                tables.append({"rows": rows, "bbox": tuple(tbl.bbox)})
+                tables.append({"rows": rows, "bbox": tuple(tbl.bbox), "tbl": tbl,
+                               "page": page, "blank_boxes": blank_boxes})
                 table_bboxes.append(tuple(tbl.bbox))
             total_tables += len(tables)
 
@@ -525,7 +739,15 @@ def convert(pdf_bytes):
 
             for item in items:
                 if item["kind"] == "table":
-                    out.append(_render_table(item["data"]["rows"]))
+                    tbl_data = item["data"]
+                    tbl_obj = tbl_data.get("tbl")
+                    if tbl_obj and _is_complex_table(tbl_obj):
+                        out.append(_render_html_table(
+                            tbl_obj, tbl_data["rows"],
+                            tbl_data["page"], tbl_data["blank_boxes"],
+                        ))
+                    else:
+                        out.append(_render_table(tbl_data["rows"]))
                     out.append("")
                     continue
                 ln = item["data"]

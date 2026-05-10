@@ -59,7 +59,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   if (msg.type === "convert") {
     if (!ready) {
-      broadcast({ target: "popup", type: "error", message: "Python runtime not ready yet." });
+      broadcast({ target: "popup", type: "error", message: "Not ready yet — please wait." });
       return false;
     }
     (async () => {

@@ -2,7 +2,8 @@
   "manifest_version": 3,
   "name": "PDF to MD",
   "version": "0.1.0",
-  "description": "Convert PDF to Markdown — 100% local, no uploads, your files stay private.",
+  "description": "Convert any PDF tab to Markdown — 100% local, no uploads, no servers. Your files never leave your browser.",
+  "minimum_chrome_version": "116",
   "permissions": ["activeTab", "offscreen", "downloads", "storage"],
   "background": {
     "service_worker": "background.js"
@@ -24,17 +25,5 @@
   },
   "content_security_policy": {
     "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
-  },
-  "web_accessible_resources": [
-    {
-      "resources": [
-        "lib/pyodide/*",
-        "lib/wheels/*",
-        "python/*",
-        "offscreen.html",
-        "offscreen.js"
-      ],
-      "matches": ["<all_urls>"]
-    }
-  ]
+  }
 }

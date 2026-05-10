@@ -214,7 +214,6 @@ async function init() {
 
   chrome.runtime.sendMessage({ type: "ensure-offscreen" });
 
-  status("Checking Python runtime…");
   try {
     const resp = await chrome.runtime.sendMessage({ target: "offscreen", type: "get-status" });
     if (resp?.ready) {
@@ -222,10 +221,10 @@ async function init() {
       $("convert").disabled = false;
       $("convert").setAttribute("aria-disabled", "false");
     } else {
-      status("Loading Python runtime…");
+      status("Loading…");
     }
   } catch {
-    status("Loading Python runtime…");
+    status("Loading…");
   }
 
   $("convert").addEventListener("click", async () => {
@@ -233,7 +232,7 @@ async function init() {
     const controller = new AbortController();
     const fetchTimeout = setTimeout(() => controller.abort(), 120_000);
     try {
-      status("Fetching PDF…");
+      status("Fetching… 0%");
       const resp = await fetch(url, { signal: controller.signal });
       clearTimeout(fetchTimeout);
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
@@ -245,8 +244,24 @@ async function init() {
         saveCachedStem(currentTabId, displayStem);
       }
 
-      const pdfBytes = await resp.arrayBuffer();
-      const bytes = new Uint8Array(pdfBytes);
+      const contentLength = parseInt(resp.headers.get("content-length") || "0");
+      const reader = resp.body.getReader();
+      const chunks = [];
+      let received = 0;
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        received += value.length;
+        if (contentLength > 0) {
+          status(`Fetching… ${Math.min(99, Math.round(received / contentLength * 100))}%`);
+        }
+      }
+
+      const bytes = new Uint8Array(received);
+      let pos = 0;
+      for (const chunk of chunks) { bytes.set(chunk, pos); pos += chunk.length; }
+
       let binary = "";
       for (let i = 0; i < bytes.length; i += 8192) {
         binary += String.fromCharCode.apply(null, bytes.subarray(i, i + 8192));
