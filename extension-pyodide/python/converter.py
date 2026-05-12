@@ -10,15 +10,53 @@ from collections import Counter
 
 import pdfplumber
 
-BULLET_RE = re.compile(r"^\s*[•‣◦●○▪■□–—\-*]\s+(.*)")
+BULLET_RE = re.compile(r"^\s*[•‣◦●○▪■□–—\-*⚫・]\s*(.+)")
 ORDERED_RE = re.compile(r"^\s*(\d+)[.)]\s+(.*)")
 PAGE_NUM_RE = re.compile(
     r"^\s*(?:[ivxlcdm]+|\d+|page\s+\d+|trang\s+\d+|\d+\s*[/of]\s*\d+)\s*$",
     re.IGNORECASE,
 )
+# Numeric heading: "1.", "1.1", "1.1.1" (also fullwidth digits / dots).
+NUMERIC_HEADING_RE = re.compile(
+    r"^\s*([０-９\d]+(?:[\.．][０-９\d]+)*)(?:[\.．][\s　]*|[\s　]+)[^\d\s０-９．\.]"
+)
 MONO_HINTS = ("mono", "courier", "consolas", "menlo")
 
-TABLE_SETTINGS = {"edge_min_length": 50}
+_CJK_CHAR_RE = re.compile(r"[　-ヿ㐀-鿿＀-￯]")
+
+
+def _collapse_vertical_cell(text):
+    """Join stacked CJK chars (one char per line) into a single word.
+    PDFs with narrow header columns often render labels vertically — pdfplumber
+    extracts each char on its own line. Joining restores the readable form
+    (e.g. "現\\n用\\n・\\n予\\n備\\n区\\n分" → "現用・予備区分").
+
+    Heuristic: 3+ non-empty lines, every line ≤2 chars, at least one CJK char.
+    Short non-CJK stacks (e.g. "Y/M/D") are left alone."""
+    if not text or "\n" not in text:
+        return text
+    lines = [l.strip() for l in text.split("\n")]
+    lines = [l for l in lines if l]
+    if len(lines) < 3:
+        return text
+    if not all(len(l) <= 2 for l in lines):
+        return text
+    if not any(_CJK_CHAR_RE.search(l) for l in lines):
+        return text
+    return "".join(lines)
+
+TABLE_SETTINGS = {
+    "horizontal_strategy": "lines",
+    "vertical_strategy": "lines",
+    "edge_min_length": 20,
+}
+# Fallback when default detection misses rows at the bottom of a table because
+# the bottom horizontal border isn't drawn (common in multi-page tables).
+TABLE_SETTINGS_TEXT_ROWS = {
+    "horizontal_strategy": "text",
+    "vertical_strategy": "lines",
+    "edge_min_length": 20,
+}
 
 BLANK_BOX_MAX_H = 30   # pt — higher → table/border, not an answer box
 BLANK_BOX_MAX_W = 100  # pt
@@ -88,12 +126,16 @@ def _apply_blank_markers(lines, blank_boxes):
     return out
 
 
-def _filter_vertical_chars(chars, page_height, x_tol=3, min_column=5, min_y_span_ratio=0.3, isolation_radius=30):
+def _filter_vertical_chars(chars, page_height, x_tol=3, min_column=5,
+                            min_y_span_ratio=0.08, isolation_radius=15):
     """Drop chars that are part of vertical-text decoration columns
-    (book-spine style). A char is dropped only if BOTH:
-      1. It belongs to a column of ≥5 same-X chars spanning ≥30% page height
+    (book-spine style or flowchart vertical labels). A char is dropped if BOTH:
+      1. It belongs to a column of ≥`min_column` same-X chars spanning
+         ≥`min_y_span_ratio` of page height.
       2. It has no horizontal neighbor within `isolation_radius` pt at its own Y
-         (i.e. it is isolated from regular horizontal text on its row)
+         (i.e. no adjacent in-word char on its row).
+    `isolation_radius` is set so regular word-internal char spacing (~5–10 pt)
+    counts as a neighbor, but flowchart column spacing (≥20 pt) does not.
     """
     if not chars or page_height <= 0:
         return chars
@@ -219,7 +261,7 @@ def _heading_level(size, body):
         return 1
     if size > body * 1.3:
         return 2
-    if size > body * 1.15:
+    if size > body * 1.25:
         return 3
     return 0
 
@@ -318,6 +360,66 @@ def _strip_empty_columns(rows):
     return [[r[c] if c < len(r) else "" for c in keep] for r in rows]
 
 
+_PURE_NUMBER_RE = re.compile(r"[\d０-９.,\-()（）\s]+")
+
+
+def _is_pure_number(s):
+    """True if s is just digits (ASCII/fullwidth) plus parens, dots, commas, signs."""
+    s = (s or "").strip()
+    if not s:
+        return False
+    return bool(_PURE_NUMBER_RE.fullmatch(s))
+
+
+def _merge_split_cells_up(rows):
+    """Undo cell-line splits from text-strategy table extraction. When a
+    multi-line cell is split, the item label may land on either the first
+    or the second physical line; the other line shows up as a "sparse"
+    row carrying just the continuation in one column.
+    Pair adjacent rows greedily: a sparse row alongside a dense row that
+    shares the sparse column is merged into the dense row, regardless of
+    direction. The dense row's existing text comes first when the dense
+    row is above; otherwise the sparse text comes first.
+    Skip the merge when both the dense cell and the sparse cell are pure
+    numbers — these are distinct values (e.g., an annotation row showing
+    the total record size right below the last position), not a split cell."""
+    if not rows or len(rows) < 2:
+        return rows
+    rows = [list(r) for r in rows]
+    n = len(rows)
+    out = []
+    i = 0
+    def cols_with_text(row):
+        return [c for c, v in enumerate(row) if v and v.strip()]
+    while i < n:
+        r = rows[i]
+        r_cols = cols_with_text(r)
+        if i + 1 < n:
+            nxt = rows[i + 1]
+            n_cols = cols_with_text(nxt)
+            # Dense row followed by sparse row sharing a column → merge sparse into dense.
+            if len(r_cols) >= 2 and len(n_cols) == 1 and n_cols[0] in r_cols:
+                c = n_cols[0]
+                if not (_is_pure_number(r[c]) and _is_pure_number(nxt[c])):
+                    merged = list(r)
+                    merged[c] = (r[c].strip() + " " + nxt[c].strip()).strip()
+                    out.append(merged)
+                    i += 2
+                    continue
+            # Sparse row followed by dense row sharing a column → merge sparse into dense.
+            if len(r_cols) == 1 and len(n_cols) >= 2 and r_cols[0] in n_cols:
+                c = r_cols[0]
+                if not (_is_pure_number(r[c]) and _is_pure_number(nxt[c])):
+                    merged = list(nxt)
+                    merged[c] = (r[c].strip() + " " + nxt[c].strip()).strip()
+                    out.append(merged)
+                    i += 2
+                    continue
+        out.append(r)
+        i += 1
+    return out
+
+
 def _merge_continuation_rows(rows):
     """Merge fragment-rows into the previous row's same columns.
     Handles two patterns:
@@ -382,7 +484,12 @@ def _merge_vertical_text_column(rows):
     """For each column, detect if it contains a vertical-text continuation
     pattern (label-value sequence) and merge all non-empty cells into the
     first one. Triggered when the column has multiple short cells with at
-    least one containing ':' (label-value indicator)."""
+    least one containing ':' (label-value indicator).
+
+    Only fires when the rows being merged are *continuation rows* — rows that
+    have content in column c but are mostly empty elsewhere. If those rows
+    have their own labels in other columns, they are independent table rows,
+    not vertical-text continuation, and must not be merged."""
     if not rows or len(rows) < 3:
         return rows
     n_cols = max(len(r) for r in rows)
@@ -394,6 +501,15 @@ def _merge_vertical_text_column(rows):
         has_colon = any(":" in v or "：" in v for _, v in values)
         all_short = all(len(v) < 25 for _, v in values)
         if not (has_colon and all_short):
+            continue
+        # Continuation rows have empty cells elsewhere. If most rows being
+        # merged carry their own content in another column, they're separate
+        # rows and merging would destroy data.
+        other_filled = 0
+        for i, _ in values[1:]:
+            if any(rows[i][cc].strip() for cc in range(n_cols) if cc != c):
+                other_filled += 1
+        if other_filled >= len(values[1:]) // 2 + 1:
             continue
         first_idx = values[0][0]
         merged = " ".join(v for _, v in values)
@@ -495,7 +611,9 @@ def _is_complex_table(tbl):
     return False
 
 
-def _render_html_table(tbl, extracted, page, blank_boxes):
+def _render_html_table(tbl, extracted, page, blank_boxes,
+                       override_xs=None, override_phantom_cols=None,
+                       override_structural_cols=None):
     """Render a complex table as HTML with colspan/rowspan.
 
     Also handles two common PDF artifacts:
@@ -503,10 +621,20 @@ def _render_html_table(tbl, extracted, page, blank_boxes):
     - Text boxes: bordered rectangles with 1 real column → rendered as single-column table
     - Blank answer boxes: small bordered squares within text → wrapped with | markers
 
+    `override_xs` lets callers pass a unified x-boundary list shared by all
+    continuation tables of the same logical PDF table. Without this, each page
+    derives its own xs from its own cells; pages that lack a structural column
+    end up with a shifted grid, breaking alignment after the HTML-level merge.
+    `override_phantom_cols` is the phantom-col set computed across the whole
+    continuation run (intersection); using it locally keeps real-on-other-pages
+    cols visible here so they align with the pages where they're filled.
+
     Falls back to Markdown on any error.
     """
     try:
         xs, ys = _grid_bounds(tbl)
+        if override_xs is not None:
+            xs = list(override_xs)
         n_rows = max(1, len(ys) - 1)
         n_cols = max(1, len(xs) - 1)
 
@@ -546,23 +674,28 @@ def _render_html_table(tbl, extracted, page, blank_boxes):
                         if rr != r0 or cc != c0:
                             grid[rr][cc] = "x"
 
-        # Majority-based phantom column detection.
-        # A cs=1 non-empty cell anchors its column as real.
-        # Otherwise, ≥80% empty non-x cells → phantom.
-        phantom_cols = set()
-        for c in range(n_cols):
-            col_cells = [grid[r][c] for r in range(n_rows)]
-            if any(isinstance(cell, dict) and cell["text"] and cell["cs"] == 1
-                   for cell in col_cells):
-                continue
-            non_x = [cell for cell in col_cells if cell != "x"]
-            if not non_x:
-                phantom_cols.add(c)
-                continue
-            empty = sum(1 for cell in non_x
-                        if cell is None or (isinstance(cell, dict) and not cell["text"]))
-            if empty / len(non_x) >= 0.8:
-                phantom_cols.add(c)
+        if override_phantom_cols is not None:
+            phantom_cols = set(override_phantom_cols)
+        else:
+            phantom_cols = _phantom_cols_for_grid(grid, n_rows, n_cols)
+
+        # Expand empty rowspan placeholders into explicit per-row empty cells.
+        # Rowspans for empty structural cells (level-indent placeholders) make
+        # the rendered HTML inconsistent across rows — browsers auto-size cols
+        # based on which rows declare cells at that col, so rows inside the
+        # rowspan render at different x positions than rows that introduce
+        # their own placeholder. Materialising each placeholder as a real <td>
+        # gives every row the same cell count at every col and keeps the
+        # visual alignment consistent.
+        for r in range(n_rows):
+            for c in range(n_cols):
+                cell = grid[r][c]
+                if not (isinstance(cell, dict) and not cell["text"] and cell["rs"] > 1 and cell["cs"] == 1):
+                    continue
+                for rr in range(r + 1, min(r + cell["rs"], n_rows)):
+                    if grid[rr][c] == "x":
+                        grid[rr][c] = {"text": "", "cs": 1, "rs": 1}
+                cell["rs"] = 1
 
         non_phantom = [c for c in range(n_cols) if c not in phantom_cols]
         non_empty_cols = [c for c in non_phantom if any(
@@ -589,18 +722,24 @@ def _render_html_table(tbl, extracted, page, blank_boxes):
         # (cs>1) in some rows but never have independent (cs=1) content.
         # In such columns, rows with empty cs=1 cells are alignment artifacts
         # caused by colspan cells in other row groups → merge into adjacent cell.
-        structural_cols = set()
-        for c in non_phantom:
-            has_cs1 = any(
-                isinstance(grid[r][c], dict) and grid[r][c]["text"] and grid[r][c]["cs"] == 1
-                for r in range(n_rows)
-            )
-            has_span = any(
-                isinstance(grid[r][c], dict) and grid[r][c]["text"] and grid[r][c]["cs"] > 1
-                for r in range(n_rows)
-            )
-            if not has_cs1 and has_span:
-                structural_cols.add(c)
+        # For multi-page tables, callers pass a unified structural set that
+        # accounts for spans on other pages (a col may be span-only on one
+        # page but empty on another).
+        if override_structural_cols is not None:
+            structural_cols = set(override_structural_cols) - phantom_cols
+        else:
+            structural_cols = set()
+            for c in non_phantom:
+                has_cs1 = any(
+                    isinstance(grid[r][c], dict) and grid[r][c]["text"] and grid[r][c]["cs"] == 1
+                    for r in range(n_rows)
+                )
+                has_span = any(
+                    isinstance(grid[r][c], dict) and grid[r][c]["text"] and grid[r][c]["cs"] > 1
+                    for r in range(n_rows)
+                )
+                if not has_cs1 and has_span:
+                    structural_cols.add(c)
 
         for r in range(n_rows):
             for c in range(n_cols - 1):
@@ -619,21 +758,44 @@ def _render_html_table(tbl, extracted, page, blank_boxes):
                     grid[r][c] = {"text": next_cell["text"], "cs": nc - c + next_cell["cs"], "rs": next_cell["rs"]}
                     grid[r][nc] = "x"
 
+        # Drop rows where no cell carries actual text. PDFs often produce
+        # phantom horizontal grid lines that create empty filler rows between
+        # data rows; these are pure noise. Shrink rowspans of cells whose span
+        # crosses dropped rows so the visible table still aligns.
+        keep_row = [
+            any(isinstance(grid[r][c], dict) and grid[r][c]["text"]
+                for c in range(n_cols))
+            for r in range(n_rows)
+        ]
+        for r in range(n_rows):
+            if not keep_row[r]:
+                continue
+            for c in range(n_cols):
+                cell = grid[r][c]
+                if isinstance(cell, dict) and cell["rs"] > 1:
+                    new_rs = sum(
+                        1 for rr in range(r, min(r + cell["rs"], n_rows))
+                        if keep_row[rr]
+                    )
+                    cell["rs"] = max(1, new_rs)
+
         # Full table: skip phantom columns, adjust colspan to exclude them.
+        # For None cells (no anchor) in non-phantom columns, emit empty <td>
+        # so subsequent cells stay in their correct visual column.
         out = ["<table>"]
         for r in range(n_rows):
-            row = grid[r]
-            has_content = any(
-                isinstance(row[c], dict) and (c not in phantom_cols or row[c]["text"])
-                for c in range(n_cols)
-            )
-            if not has_content:
+            if not keep_row[r]:
                 continue
+            row = grid[r]
             out.append("<tr>")
             for c, cell in enumerate(row):
-                if cell is None or cell == "x":
+                if cell == "x":
                     continue
-                if c in phantom_cols and not cell["text"]:
+                if c in phantom_cols:
+                    if cell is None or not (isinstance(cell, dict) and cell["text"]):
+                        continue
+                if cell is None:
+                    out.append('  <td></td>')
                     continue
                 effective_cs = sum(
                     1 for cc in range(c, c + cell["cs"]) if cc not in phantom_cols
@@ -654,6 +816,216 @@ def _render_html_table(tbl, extracted, page, blank_boxes):
         return _render_table(extracted)
 
 
+def _normalize_artifact_text(text):
+    """Normalize header/footer text for cross-page comparison:
+    - unify circled-C variants
+    - strip year tokens (e.g. "2023", "2016-2023")
+    - drop standalone digit tokens (page numbers)
+    - strip leading digit runs glued to letters ("72All" → "All")
+    Embedded digits inside other words are kept so "Chapter 1" stays distinct."""
+    text = text.replace("ⓒ", "©").replace("Ⓒ", "©")
+    text = re.sub(r"\b(?:19|20)\d{2}(?:[-–]\d{4})?\b", "", text)
+    tokens = []
+    for t in re.split(r"\s+", text):
+        if not t:
+            continue
+        if re.fullmatch(r"[\d０-９]+", t):
+            continue
+        m = re.match(r"^[\d０-９]+([A-Za-z　-鿿].*)", t)
+        if m:
+            t = m.group(1)
+        if t:
+            tokens.append(t)
+    return " ".join(tokens).strip()
+
+
+def _collect_repeating_artifacts(pages_lines, n_pages, top_ratio=0.15, bottom_ratio=0.12, min_ratio=0.10):
+    """Find lines that repeat across many pages in the top/bottom margins.
+    Returns a set of normalized texts to drop."""
+    if n_pages < 3:
+        return set()
+    top_counts = Counter()
+    bot_counts = Counter()
+    for page_idx, (lines, ph) in enumerate(pages_lines):
+        seen_top = set()
+        seen_bot = set()
+        for l in lines:
+            t = l["text"].strip()
+            if not t or len(t) < 2:
+                continue
+            norm = _normalize_artifact_text(t)
+            if not norm or len(norm) < 2:
+                continue
+            if l["top"] < ph * top_ratio:
+                seen_top.add(norm)
+            elif l["bottom"] > ph * (1 - bottom_ratio):
+                seen_bot.add(norm)
+        for n in seen_top:
+            top_counts[n] += 1
+        for n in seen_bot:
+            bot_counts[n] += 1
+    threshold = max(2, int(n_pages * min_ratio))
+    artifacts = set()
+    for n, c in top_counts.items():
+        if c >= threshold:
+            artifacts.add(n)
+    for n, c in bot_counts.items():
+        if c >= threshold:
+            artifacts.add(n)
+    return artifacts
+
+
+def _is_artifact_line(line, ph, artifacts, top_ratio=0.15, bottom_ratio=0.12):
+    if not artifacts:
+        return False
+    in_top = line["top"] < ph * top_ratio
+    in_bot = line["bottom"] > ph * (1 - bottom_ratio)
+    if not (in_top or in_bot):
+        return False
+    text = line["text"].strip()
+    # Don't drop numeric-prefixed headings — those are real section headings
+    # repeated as running headers, useful for structure.
+    if NUMERIC_HEADING_RE.match(text):
+        return False
+    norm = _normalize_artifact_text(text)
+    return norm in artifacts
+
+
+def _merge_continuation_tables(markdown):
+    """Merge consecutive <table> blocks for the same logical PDF table — they
+    typically span multiple pages with header rows repeating. Keep the first
+    table's header (rows up to and including the column header row), then
+    append only data rows from the following tables."""
+    pattern = re.compile(r"<table>([\s\S]*?)</table>", re.MULTILINE)
+    fname_re = re.compile(r"<td[^>]*>ファイル名\s*\n?\s*[（\(](.+?)[）\)]")
+    # Inline parens variant: ファイル名 cell may be empty, parens in next cell.
+    paren_only_re = re.compile(r"<td[^>]*>[（\(]([^）\)]{1,40})[）\)]</td>")
+    title_re = re.compile(
+        r"<td[^>]*>(レコード項目定義|拡張外部公開ファイル一覧|JRA-DB取扱い一覧|"
+        r"地方競馬共同TZS.*?タイミング|ファイル構造図.*?)</td>"
+    )
+    tables = list(pattern.finditer(markdown))
+    if len(tables) < 2:
+        return markdown
+
+    def get_id(body):
+        """Identifier = (table_title, fname). Either may be None.
+        Two tables match if both fields agree and at least one is non-None."""
+        title_m = title_re.search(body)
+        title = title_m.group(1).strip() if title_m else None
+        fname_m = fname_re.search(body)
+        fname = fname_m.group(1).strip() if fname_m else None
+        if fname is None:
+            # Fallback: first parenthesised value that looks like a file name
+            # (Japanese, contains no slashes etc.). Used for continuation pages
+            # where the ファイル名 cell is split across multiple table cells.
+            for pm in paren_only_re.finditer(body[:1500]):
+                v = pm.group(1).strip()
+                if v and v not in ("地方競馬共同TZS", " ", "ＪＲＡ－ＤＢファイル"):
+                    fname = v
+                    break
+        return (title, fname)
+
+    def split_header_data(body):
+        """Return (header_rows_text, [data_rows_html]).
+        Header rows = rows until and including the row that contains "項番"
+        or "区分" (column header). Data rows = everything after."""
+        rows = re.findall(r"<tr>[\s\S]*?</tr>", body)
+        if not rows:
+            return body, []
+        header_end = 0
+        for i, r in enumerate(rows):
+            if re.search(r"<td[^>]*>(?:項番|区分|Ｎｏ\.|No\.|項\s*目)</td>", r):
+                header_end = i + 1
+                break
+        if header_end == 0:
+            # Fallback: assume first 2 rows are headers
+            header_end = min(2, len(rows))
+        return rows[:header_end], rows[header_end:]
+
+    # Group consecutive tables with the same (title, fname) identifier.
+    out_parts = []
+    last_end = 0
+    i = 0
+    while i < len(tables):
+        m = tables[i]
+        body = m.group(1)
+        cur_id = get_id(body)
+        title, fname = cur_id
+        if not title and not fname:
+            out_parts.append(markdown[last_end:m.end()])
+            last_end = m.end()
+            i += 1
+            continue
+        # Find run of consecutive same-id tables (only allow whitespace between)
+        run = [i]
+        j = i + 1
+        while j < len(tables):
+            next_m = tables[j]
+            between = markdown[tables[j-1].end():next_m.start()]
+            if between.strip():
+                break
+            n_title, n_fname = get_id(next_m.group(1))
+            # Both tables must agree on both title and fname (when present).
+            # An unknown fname (None) on a follow-up table is NOT treated as
+            # a match — it would let unrelated tables collapse into the run.
+            same_title = (title or "") == (n_title or "")
+            same_fname = (fname or "") == (n_fname or "") and fname is not None
+            if not (same_title and same_fname):
+                break
+            run.append(j)
+            j += 1
+        if len(run) == 1:
+            out_parts.append(markdown[last_end:m.end()])
+            last_end = m.end()
+            i += 1
+            continue
+        # Build merged table
+        first_body = tables[run[0]].group(1)
+        head_rows, first_data = split_header_data(first_body)
+        merged_data = list(first_data)
+        for k in run[1:]:
+            _, data = split_header_data(tables[k].group(1))
+            merged_data.extend(data)
+        merged_body = "\n".join(head_rows + merged_data)
+        merged_html = f"<table>\n{merged_body}\n</table>"
+        # Emit content up to first table's start, then merged
+        out_parts.append(markdown[last_end:m.start()])
+        out_parts.append(merged_html)
+        last_end = tables[run[-1]].end()
+        i = run[-1] + 1
+    out_parts.append(markdown[last_end:])
+    return "".join(out_parts)
+
+
+def _dedupe_consecutive_headings(lines):
+    """Drop heading repeats from running headers. A heading at level L is
+    skipped when the most recent heading at level L (within the same parent
+    scope — i.e. no higher-level heading has appeared since) has the same
+    text. The trailing blank line emitted with the heading is also skipped."""
+    out = []
+    latest = {}  # level → heading line text
+    skip_next_blank = False
+    for l in lines:
+        if skip_next_blank:
+            skip_next_blank = False
+            if l == "":
+                continue
+        m = re.match(r"^(#+)\s+(.*)$", l)
+        if m:
+            lvl = len(m.group(1))
+            if latest.get(lvl) == l:
+                skip_next_blank = True
+                continue
+            # New heading at level lvl → invalidate deeper levels.
+            for L in list(latest):
+                if L >= lvl:
+                    latest.pop(L, None)
+            latest[lvl] = l
+        out.append(l)
+    return out
+
+
 def _line_inside_any_bbox(line, bboxes):
     cx = (line["x0"] + line["x1"]) / 2
     cy = (line["top"] + line["bottom"]) / 2
@@ -663,6 +1035,162 @@ def _line_inside_any_bbox(line, bboxes):
     return False
 
 
+_FNAME_RE = re.compile(r"ファイル名\s*\n?\s*[（(]([^（()）]+)[）)]")
+_TITLE_VALUES = ("レコード項目定義", "拡張外部公開ファイル一覧", "JRA-DB取扱い一覧")
+
+
+def _table_identifier(rows):
+    """Extract (title, file_name) from the first rows of a レコード項目定義-style
+    table. Used to group continuation pages so they can share a unified
+    x-boundary list and stay aligned after the HTML-level merge."""
+    if not rows:
+        return (None, None)
+    title = None
+    fname = None
+    for row in rows[:2]:
+        for cell in row:
+            if not cell:
+                continue
+            t = cell.strip()
+            if not title and t in _TITLE_VALUES:
+                title = t
+            if not fname:
+                m = _FNAME_RE.search(t)
+                if m:
+                    fname = m.group(1).strip()
+    return (title, fname)
+
+
+def _unified_xs(xs_list, tol=2):
+    """Merge multiple xs sequences into one sorted list, treating values
+    within `tol` points as the same boundary (keeps the average)."""
+    all_xs = sorted(x for xs in xs_list for x in xs)
+    if not all_xs:
+        return []
+    out = [all_xs[0]]
+    for x in all_xs[1:]:
+        if x - out[-1] <= tol:
+            out[-1] = (out[-1] + x) / 2
+        else:
+            out.append(x)
+    return out
+
+
+def _build_grid(tbl, extracted, xs, ys):
+    """Build the {dict|"x"|None} grid from a pdfplumber table snapped to
+    the given xs/ys."""
+    n_rows = max(1, len(ys) - 1)
+    n_cols = max(1, len(xs) - 1)
+    grid = [[None] * n_cols for _ in range(n_rows)]
+    for r_phys, tbl_row in enumerate(tbl.rows):
+        ex_row = extracted[r_phys] if r_phys < len(extracted) else []
+        for c_phys, cell in enumerate(tbl_row.cells):
+            if cell is None:
+                continue
+            r0, c0, rs, cs = _cell_spans(cell, xs, ys)
+            if not (0 <= r0 < n_rows and 0 <= c0 < n_cols):
+                continue
+            text = (ex_row[c_phys] if c_phys < len(ex_row) else None) or ""
+            grid[r0][c0] = {"text": text.strip(), "cs": cs, "rs": rs}
+            for rr in range(r0, min(r0 + rs, n_rows)):
+                for cc in range(c0, min(c0 + cs, n_cols)):
+                    if rr != r0 or cc != c0:
+                        grid[rr][cc] = "x"
+    return grid
+
+
+def _phantom_cols_for_grid(grid, n_rows, n_cols):
+    phantom = set()
+    for c in range(n_cols):
+        col_cells = [grid[r][c] for r in range(n_rows)]
+        if any(isinstance(cell, dict) and cell["text"] for cell in col_cells):
+            continue
+        non_x = [cell for cell in col_cells if cell != "x"]
+        if not non_x:
+            phantom.add(c)
+            continue
+        if all(isinstance(cell, dict) and not cell["text"] for cell in non_x):
+            coverage = sum(cell["rs"] for cell in non_x)
+            if coverage >= n_rows * 0.5:
+                continue
+        empty = sum(1 for cell in non_x
+                    if cell is None or (isinstance(cell, dict) and not cell["text"]))
+        if empty / len(non_x) >= 0.8:
+            phantom.add(c)
+    return phantom
+
+
+def _compute_table_unified_xs(tables_data):
+    """Group consecutive tables by (title, file_name) identifier. For each
+    group with >1 table, attach a unified xs list and a shared phantom_cols
+    set (intersection across all pages of the run) to each member, so the
+    rendered rows stay aligned after the HTML-level merge."""
+    # Flatten to a list in page order
+    flat = []
+    for pd in tables_data:
+        for tbl in pd["tables"]:
+            flat.append(tbl)
+    if len(flat) < 2:
+        return
+    i = 0
+    while i < len(flat):
+        ident = _table_identifier(flat[i]["rows"])
+        if not (ident[0] or ident[1]):
+            i += 1
+            continue
+        run = [i]
+        j = i + 1
+        while j < len(flat):
+            nid = _table_identifier(flat[j]["rows"])
+            same_title = (ident[0] or "") == (nid[0] or "")
+            same_fname = (ident[1] or "") == (nid[1] or "") and ident[1] is not None
+            if not (same_title and same_fname):
+                break
+            run.append(j)
+            j += 1
+        if len(run) > 1:
+            xs_list = [_grid_bounds(flat[k]["tbl"])[0] for k in run]
+            uxs = _unified_xs(xs_list)
+            # Compute phantom_cols per page, take intersection: a col is only
+            # phantom if it's phantom on every page of the run. This prevents
+            # a col that has real content on one page (e.g., level-5 items
+            # only on later pages) from being dropped on the others.
+            # Also compute structural_cols across the union of all pages:
+            # a col is structural when, across the whole run, it only ever
+            # carries cs>1 anchors and never standalone cs=1 content. Without
+            # this, a page that has only empty cells at the col would miss
+            # the merge of empty + next-cell, breaking visual alignment.
+            shared_phantom = None
+            has_cs1_run = [False] * (len(uxs) - 1)
+            has_span_run = [False] * (len(uxs) - 1)
+            for k in run:
+                tbl = flat[k]["tbl"]
+                _, ys = _grid_bounds(tbl)
+                n_rows_k = max(1, len(ys) - 1)
+                n_cols_k = max(1, len(uxs) - 1)
+                grid = _build_grid(tbl, flat[k]["rows"], uxs, ys)
+                ph = _phantom_cols_for_grid(grid, n_rows_k, n_cols_k)
+                shared_phantom = ph if shared_phantom is None else (shared_phantom & ph)
+                for c in range(n_cols_k):
+                    for r in range(n_rows_k):
+                        cell = grid[r][c]
+                        if not (isinstance(cell, dict) and cell["text"]):
+                            continue
+                        if cell["cs"] == 1:
+                            has_cs1_run[c] = True
+                        elif cell["cs"] > 1:
+                            has_span_run[c] = True
+            shared_structural = {
+                c for c in range(len(uxs) - 1)
+                if has_span_run[c] and not has_cs1_run[c]
+            }
+            for k in run:
+                flat[k]["override_xs"] = uxs
+                flat[k]["override_phantom_cols"] = shared_phantom or set()
+                flat[k]["override_structural_cols"] = shared_structural
+        i = j if j > i else i + 1
+
+
 def convert(pdf_bytes):
     pdf = pdfplumber.open(io.BytesIO(pdf_bytes))
     try:
@@ -670,15 +1198,34 @@ def convert(pdf_bytes):
         total_tables = 0
         all_chars = []
 
+        raw_pages_lines = []  # (lines, page_height) per page — for artifact detection
         for page in pdf.pages:
             raw_blank_boxes = _detect_blank_boxes(page)
             chars = _filter_vertical_chars(page.chars, page.height)
             all_chars.extend(chars)
             lines = _chars_to_lines(chars)
             lines = _filter_page_artifacts(lines, page.height)
+            raw_pages_lines.append((lines, page.height))
 
             try:
                 pdfp_tables = page.find_tables(table_settings=TABLE_SETTINGS)
+                # Re-run with text-row detection for any table whose bbox stops
+                # well above the page bottom — multi-page tables often lack the
+                # final horizontal border so the line strategy clips rows.
+                if pdfp_tables:
+                    extended = []
+                    for t in pdfp_tables:
+                        below = page.height - t.bbox[3]
+                        if below > 30:
+                            t_alt = next((
+                                u for u in page.find_tables(table_settings=TABLE_SETTINGS_TEXT_ROWS)
+                                if abs(u.bbox[0] - t.bbox[0]) < 5 and abs(u.bbox[2] - t.bbox[2]) < 5
+                                and u.bbox[3] > t.bbox[3]
+                            ), None)
+                            extended.append(t_alt if t_alt is not None else t)
+                        else:
+                            extended.append(t)
+                    pdfp_tables = extended
                 pdfp_tables = _filter_nested_tables(pdfp_tables)
             except Exception:
                 pdfp_tables = []
@@ -706,8 +1253,24 @@ def convert(pdf_bytes):
                 n_cols = max(len(r) for r in rows)
                 if n_cols < 2:
                     continue
-                rows = [[(c or "").strip() for c in r] for r in rows]
+                rows = [[_collapse_vertical_cell((c or "").strip()) for c in r] for r in rows]
+                rows = _merge_split_cells_up(rows)
                 if not any(any(c for c in r) for r in rows):
+                    continue
+                # Skip phantom tables: tables where every non-empty cell
+                # contains a fragment repeated >50% (a signature of vertical
+                # text or diagram labels misinterpreted as a table).
+                meaningful_cells = 0
+                for r in rows:
+                    for c in r:
+                        if not c or len(c) <= 2:
+                            continue
+                        parts = c.split("\n") if "\n" in c else [c]
+                        parts = [p.strip() for p in parts if p.strip()]
+                        if len(parts) >= 2 and len(set(parts)) <= len(parts) / 2:
+                            continue  # duplicated fragments
+                        meaningful_cells += 1
+                if meaningful_cells < 4:
                     continue
                 tables.append({"rows": rows, "bbox": tuple(tbl.bbox), "tbl": tbl,
                                "page": page, "blank_boxes": blank_boxes})
@@ -724,6 +1287,12 @@ def convert(pdf_bytes):
                 "height": page.height,
             })
 
+        artifacts = _collect_repeating_artifacts(raw_pages_lines, len(raw_pages_lines))
+        for pd in pages_data:
+            pd["lines"] = [l for l in pd["lines"] if not _is_artifact_line(l, pd["height"], artifacts)]
+
+        _compute_table_unified_xs(pages_data)
+
         body = _body_size_from_chars(all_chars)
         out = []
 
@@ -737,6 +1306,7 @@ def convert(pdf_bytes):
                 items.append({"y": ln["top"], "kind": "line", "data": ln})
             items.sort(key=lambda x: x["y"])
 
+            prev_bottom = None  # Bottom Y of previous emitted text line on this page.
             for item in items:
                 if item["kind"] == "table":
                     tbl_data = item["data"]
@@ -745,35 +1315,72 @@ def convert(pdf_bytes):
                         out.append(_render_html_table(
                             tbl_obj, tbl_data["rows"],
                             tbl_data["page"], tbl_data["blank_boxes"],
+                            override_xs=tbl_data.get("override_xs"),
+                            override_phantom_cols=tbl_data.get("override_phantom_cols"),
+                            override_structural_cols=tbl_data.get("override_structural_cols"),
                         ))
                     else:
                         out.append(_render_table(tbl_data["rows"]))
                     out.append("")
+                    prev_bottom = None
                     continue
                 ln = item["data"]
                 text = ln["text"].strip()
                 if not text:
                     continue
                 lvl = _heading_level(ln["size"], body)
+                # Lines ending with a sentence terminator are descriptive text,
+                # not headings (even if pdfplumber reports a slightly larger
+                # font from inline formatting).
+                if lvl and text.rstrip().endswith(("。", ".", "．")):
+                    lvl = 0
+                # Size-only headings additionally require a visual gap above —
+                # real headings start a new block. Use the PDF Y coords: if the
+                # gap to the previous line is less than ~0.6× line height, this
+                # line is a continuation, not a heading.
+                if lvl and prev_bottom is not None:
+                    gap = ln["top"] - prev_bottom
+                    line_h = max(ln["bottom"] - ln["top"], body)
+                    if gap < line_h * 0.6:
+                        lvl = 0
+                # Numeric heading override: "1.", "1.1", "1.1.1" with short
+                # text become headings with level matching dot-depth.
+                # Multi-segment (≥2 dots) is unambiguously a heading; single
+                # segment "1." also requires slightly larger font to avoid
+                # confusing with ordered list items.
+                nm = NUMERIC_HEADING_RE.match(text)
+                if (nm and len(text) <= 100
+                        and not text.rstrip().endswith(("。", ".", "．"))):
+                    segs = [s for s in re.split(r"[\.．]", nm.group(1)) if s]
+                    if len(segs) >= 2 or ln["size"] >= body * 1.05:
+                        plvl = min(max(len(segs), 1), 4)
+                        lvl = plvl if not lvl else min(lvl, plvl)
                 if lvl:
                     out.append("#" * lvl + " " + text)
                     out.append("")
+                    prev_bottom = ln["bottom"]
                     continue
                 m = BULLET_RE.match(text)
                 if m:
                     out.append("- " + m.group(1))
+                    prev_bottom = ln["bottom"]
                     continue
                 m = ORDERED_RE.match(text)
                 if m:
                     out.append(f"{m.group(1)}. {m.group(2)}")
+                    prev_bottom = ln["bottom"]
                     continue
                 if all(_is_mono(c.get("fontname", "")) for c in ln["chars"]):
                     out.append("    " + text)
+                    prev_bottom = ln["bottom"]
                     continue
                 out.append(text)
+                prev_bottom = ln["bottom"]
             out.append("")
 
+        out = _dedupe_consecutive_headings(out)
         markdown = "\n".join(out).rstrip() + "\n"
+        markdown = _merge_continuation_tables(markdown)
         return {
             "markdown": markdown,
             "pages": len(pages_data),
