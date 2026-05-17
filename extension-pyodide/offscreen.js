@@ -1,36 +1,49 @@
 import { loadPyodide } from "./lib/pyodide/pyodide.mjs";
-
-const URL_BASE = chrome.runtime.getURL("");
-const PYODIDE_PACKAGES = ["micropip", "cryptography", "cffi", "Pillow", "pycparser"];
-const CUSTOM_WHEELS = [
-  "lib/wheels/charset_normalizer-3.4.4-py3-none-any.whl",
-  "lib/wheels/pdfminer_six-20260107-py3-none-any.whl",
-  "lib/wheels/pdfplumber-0.10.4-py3-none-any.whl",
-];
+import {
+  PYODIDE_PACKAGES,
+  CUSTOM_WHEELS,
+  WHEELS_EMFS_DIR,
+  IDLE_TEARDOWN_MS,
+  getURLBase,
+  getPyodideIndexURL,
+  getConverterURL,
+} from "./constants.js";
 
 let pyodide = null;
 let ready = false;
+let idleTimer = null;
 
 function broadcast(msg) {
   chrome.runtime.sendMessage(msg).catch(() => {});
 }
 
-async function init() {
-  try {
-    broadcast({ target: "popup", type: "progress", message: "Loading… 10%" });
-    pyodide = await loadPyodide({ indexURL: URL_BASE + "lib/pyodide/" });
+function scheduleIdleTeardown() {
+  if (idleTimer) clearTimeout(idleTimer);
+  idleTimer = setTimeout(() => {
+    chrome.runtime.sendMessage({ type: "close-offscreen" }).catch(() => {});
+  }, IDLE_TEARDOWN_MS);
+}
 
-    broadcast({ target: "popup", type: "progress", message: "Loading… 50%" });
+async function init() {
+  const t0 = performance.now();
+  try {
+    broadcast({ target: "popup", type: "progress", message: "Loading Python runtime…" });
+    pyodide = await loadPyodide({
+      indexURL: getPyodideIndexURL(),
+      fullStdLib: false,
+    });
+
+    broadcast({ target: "popup", type: "progress", message: "Loading PDF libraries…" });
     await pyodide.loadPackage(PYODIDE_PACKAGES);
 
-    broadcast({ target: "popup", type: "progress", message: "Loading… 75%" });
-    try { pyodide.FS.mkdirTree("/tmp/wheels"); } catch (_) {}
+    broadcast({ target: "popup", type: "progress", message: "Installing PDF parsers…" });
+    try { pyodide.FS.mkdirTree(WHEELS_EMFS_DIR); } catch (_) {}
     const emfsPaths = [];
     for (const w of CUSTOM_WHEELS) {
       const fname = w.split("/").pop();
-      const buf = await fetch(URL_BASE + w).then((r) => r.arrayBuffer());
-      pyodide.FS.writeFile(`/tmp/wheels/${fname}`, new Uint8Array(buf));
-      emfsPaths.push(`emfs:/tmp/wheels/${fname}`);
+      const buf = await fetch(getURLBase() + w).then((r) => r.arrayBuffer());
+      pyodide.FS.writeFile(`${WHEELS_EMFS_DIR}/${fname}`, new Uint8Array(buf));
+      emfsPaths.push(`emfs:${WHEELS_EMFS_DIR}/${fname}`);
     }
     pyodide.globals.set("_wheels", emfsPaths);
     await pyodide.runPythonAsync(`
@@ -38,18 +51,31 @@ import micropip
 await micropip.install(list(_wheels), deps=False)
 `);
 
-    broadcast({ target: "popup", type: "progress", message: "Loading… 90%" });
-    const code = await fetch(URL_BASE + "python/converter.py").then((r) => r.text());
+    broadcast({ target: "popup", type: "progress", message: "Almost ready…" });
+    const code = await fetch(getConverterURL()).then((r) => r.text());
     pyodide.runPython(code);
 
     ready = true;
     broadcast({ target: "popup", type: "ready" });
+    console.log(`[pyodide] loaded: ${(performance.now() - t0).toFixed(0)}ms`);
+    scheduleIdleTeardown();
   } catch (e) {
-    broadcast({ target: "popup", type: "error", message: `Failed to initialize: ${e.message}` });
+    const msg = String(e?.message || e || "");
+    let hint;
+    if (/memory|oom/i.test(msg)) {
+      hint = "Not enough memory to load Python runtime — try closing other tabs.";
+    } else if (/wasm/i.test(msg)) {
+      hint = "WebAssembly failed — Chrome 116+ required. Please update your browser.";
+    } else if (/fetch|load|network/i.test(msg)) {
+      hint = "Failed to load required files — the extension may be corrupted. Try reinstalling.";
+    } else {
+      hint = "Failed to start Python runtime — try reloading the extension.";
+    }
+    broadcast({ target: "popup", type: "error", message: hint });
   }
 }
 
-chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.target !== "offscreen") return false;
 
   if (msg.type === "get-status") {
@@ -69,6 +95,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const result = pyodide
           .runPython("convert(bytes(_pdf_bytes))")
           .toJs({ dict_converter: Object.fromEntries });
+        pyodide.globals.delete("_pdf_bytes");
 
         const popupHandled = await new Promise((resolve) => {
           chrome.runtime.sendMessage(
@@ -78,21 +105,29 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         });
 
         if (!popupHandled) {
-          const enc = new TextEncoder().encode(result.markdown);
-          let bin = "";
-          for (let i = 0; i < enc.length; i++) bin += String.fromCharCode(enc[i]);
+          const bytes = new TextEncoder().encode(result.markdown);
+          const bin = Array.from(bytes, (b) => String.fromCharCode(b)).join("");
           chrome.runtime.sendMessage({
             type: "download",
             url: `data:text/markdown;charset=utf-8;base64,${btoa(bin)}`,
             filename: msg.filename,
           });
         }
+
+        scheduleIdleTeardown();
       } catch (e) {
-        let errMsg = e.message || "Unknown error";
-        if (/PdfReadError|PDFSyntax|PDFEncryption|PdfStreamError/i.test(errMsg)) {
-          errMsg = "Failed to parse PDF — may be encrypted or corrupted.";
-        } else if (/MemoryError/i.test(errMsg)) {
-          errMsg = "Out of memory — PDF may be too large.";
+        const raw = String(e?.message || e || "");
+        let errMsg;
+        if (/PDFEncryption|password/i.test(raw)) {
+          errMsg = "This PDF is password-protected. Remove the password first, then retry.";
+        } else if (/PdfReadError|PDFSyntax|PdfStreamError|invalid pdf/i.test(raw)) {
+          errMsg = "Cannot read this PDF — file may be corrupted. Try re-downloading it.";
+        } else if (/MemoryError|oom/i.test(raw)) {
+          errMsg = "Not enough memory — try a smaller PDF (recommended: under 50 pages).";
+        } else if (/TypeError|AttributeError|KeyError/i.test(raw)) {
+          errMsg = "Unsupported PDF format — conversion failed.";
+        } else {
+          errMsg = "Conversion failed — unsupported or damaged PDF.";
         }
         broadcast({ target: "popup", type: "error", message: errMsg });
       }

@@ -1,12 +1,13 @@
 {
   "manifest_version": 3,
   "name": "PDF to MD",
-  "version": "0.1.0",
+  "version": "0.1.3",
   "description": "Convert any PDF tab to Markdown — 100% local, no uploads, no servers. Your files never leave your browser.",
   "minimum_chrome_version": "116",
   "permissions": ["activeTab", "offscreen", "downloads", "storage"],
   "background": {
-    "service_worker": "background.js"
+    "service_worker": "background.js",
+    "type": "module"
   },
   "host_permissions": ["<all_urls>"],
   "action": {

@@ -1,4 +1,4 @@
-"use strict";
+import { STORAGE_KEY_HAS_USED } from "./constants.js";
 
 const $ = (id) => document.getElementById(id);
 const status = (msg) => ($("status").textContent = msg);
@@ -6,18 +6,37 @@ const PDF_RE = /\.pdf(?:[?#]|$)/i;
 
 let converting = false;
 let progressTimer = null;
-let progressPct = 0;
+let popupReady = false;
+let onPdfTab = false;
 
 function startFakeProgress() {
-  progressPct = 0;
+  let pct = 0;
   status("Converting… 0%");
   progressTimer = setInterval(() => {
-    if (progressPct < 95) status(`Converting… ${++progressPct}%`);
+    if (pct < 95) status(`Converting… ${++pct}%`);
   }, 500);
 }
 
 function stopFakeProgress() {
   if (progressTimer) { clearInterval(progressTimer); progressTimer = null; }
+}
+
+async function scheduleFirstTimeHint() {
+  const stored = await chrome.storage.local.get(STORAGE_KEY_HAS_USED).catch(() => ({}));
+  const isFirstTime = !stored[STORAGE_KEY_HAS_USED];
+  setTimeout(() => {
+    if (!popupReady) {
+      const el = $("hint");
+      if (el) el.textContent = isFirstTime
+        ? "First-time setup — this takes ~5s."
+        : "Reloading Python runtime — this takes ~5s.";
+    }
+  }, 3000);
+}
+
+function clearHint() {
+  const el = $("hint");
+  if (el) el.textContent = "";
 }
 
 function setConverting(active) {
@@ -116,12 +135,12 @@ function ensureValidStem(stem) {
 
 async function detectFilename(tab) {
   const strategies = [
-    ["url-path", () => tryUrlPath(tab?.url)],
-    ["url-params", () => tryUrlParams(tab?.url)],
-    ["tab-title", () => tryTabTitle(tab?.title)],
-    ["opener-tab", async () => await tryOpenerTab(tab?.openerTabId)],
+    () => tryUrlPath(tab?.url),
+    () => tryUrlParams(tab?.url),
+    () => tryTabTitle(tab?.title),
+    async () => await tryOpenerTab(tab?.openerTabId),
   ];
-  for (const [, fn] of strategies) {
+  for (const fn of strategies) {
     const result = await fn();
     if (result) return result;
   }
@@ -131,6 +150,7 @@ async function detectFilename(tab) {
 // ===== PDF detection =====
 async function detectIsPdf(url) {
   if (!url || url.startsWith("chrome://") || url.startsWith("chrome-extension://")) return false;
+  if (url.startsWith("file://")) return true;
   if (PDF_RE.test(url) || url.startsWith("blob:")) return true;
   try {
     const r = await fetch(url, { method: "HEAD" });
@@ -154,6 +174,7 @@ function handleResult({ markdown, filename, pages, tables }, sendResponse) {
   a.click();
   setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(blobUrl); }, 1000);
   if (currentTabId) chrome.storage.session.remove(`stem_${currentTabId}`).catch(() => {});
+  chrome.storage.local.set({ [STORAGE_KEY_HAS_USED]: true }).catch(() => {});
   stopFakeProgress();
   status(`Done — ${pages} pages, ${tables} tables, ${markdown.length.toLocaleString()} chars.`);
   setConverting(false);
@@ -166,6 +187,9 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   switch (msg.type) {
     case "progress": status(msg.message); break;
     case "ready":
+      popupReady = true;
+      clearHint();
+      if (!onPdfTab) break;
       status("Ready.");
       $("convert").disabled = false;
       $("convert").setAttribute("aria-disabled", "false");
@@ -197,7 +221,7 @@ async function saveCachedStem(tabId, stem) {
 // ===== Main =====
 async function init() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  const url = tab?.url || "";
+  const url = tab?.url || tab?.pendingUrl || "";
   currentTabId = tab?.id || null;
 
   displayStem = await loadCachedStem(currentTabId) || await detectFilename(tab);
@@ -206,25 +230,35 @@ async function init() {
     ? `${displayStem}.pdf`
     : "(auto-detected after fetch)";
 
+  if (!url) {
+    status('No access to this tab. If opening a local PDF, enable "Allow access to file URLs": chrome://extensions → PDF to MD → Details.');
+    return;
+  }
+
   const isPdf = await detectIsPdf(url);
   if (!isPdf) {
     status("Current tab is not a PDF.");
     return;
   }
+  onPdfTab = true;
 
   chrome.runtime.sendMessage({ type: "ensure-offscreen" });
 
   try {
     const resp = await chrome.runtime.sendMessage({ target: "offscreen", type: "get-status" });
     if (resp?.ready) {
+      popupReady = true;
+      clearHint();
       status("Ready.");
       $("convert").disabled = false;
       $("convert").setAttribute("aria-disabled", "false");
     } else {
       status("Loading…");
+      scheduleFirstTimeHint();
     }
   } catch {
     status("Loading…");
+    scheduleFirstTimeHint();
   }
 
   $("convert").addEventListener("click", async () => {
@@ -232,10 +266,36 @@ async function init() {
     const controller = new AbortController();
     const fetchTimeout = setTimeout(() => controller.abort(), 120_000);
     try {
-      status("Fetching… 0%");
-      const resp = await fetch(url, { signal: controller.signal });
+      status("Downloading PDF… 0%");
+      let resp;
+      try {
+        resp = await fetch(url, { signal: controller.signal });
+      } catch (e) {
+        clearTimeout(fetchTimeout);
+        stopFakeProgress();
+        let msg;
+        if (e.name === "AbortError") {
+          msg = "Download timed out — PDF may be too large or your connection too slow.";
+        } else if (url.startsWith("file://")) {
+          msg = 'Enable "Allow access to file URLs": chrome://extensions → PDF to MD → Details.';
+        } else {
+          msg = "Network error — check your connection and try again.";
+        }
+        status(`Error: ${msg}`);
+        setConverting(false);
+        return;
+      }
       clearTimeout(fetchTimeout);
-      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+
+      if (!resp.ok) {
+        const hints = {
+          401: "This PDF requires login — open it in the tab first, then retry.",
+          403: "Access denied — the server does not allow downloading this PDF.",
+          404: "PDF not found — the link may be broken.",
+          429: "Too many requests — please wait a moment and try again.",
+        };
+        throw new Error(hints[resp.status] || `Server returned HTTP ${resp.status}.`);
+      }
 
       if (!displayStem) {
         const fromCd = tryContentDisposition(resp.headers.get("content-disposition"));
@@ -254,7 +314,9 @@ async function init() {
         chunks.push(value);
         received += value.length;
         if (contentLength > 0) {
-          status(`Fetching… ${Math.min(99, Math.round(received / contentLength * 100))}%`);
+          status(`Downloading PDF… ${Math.min(99, Math.round(received / contentLength * 100))}%`);
+        } else {
+          status(`Downloading PDF… ${(received / 1024 / 1024).toFixed(1)} MB`);
         }
       }
 
@@ -274,10 +336,8 @@ async function init() {
         filename: `${ensureValidStem(displayStem)}.md`,
       });
     } catch (e) {
-      clearTimeout(fetchTimeout);
       stopFakeProgress();
-      const msg = e.name === "AbortError" ? "Fetch timed out (>2 min)." : e.message;
-      status(`Error: ${msg}`);
+      status(`Error: ${e.message}`);
       setConverting(false);
     }
   });

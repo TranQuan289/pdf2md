@@ -1,0 +1,31 @@
+{
+  "name": "pdf-to-md",
+  "version": "1.0.0",
+  "description": "Convert any PDF tab to Markdown, entirely inside your browser.   Chuyển đổi PDF sang Markdown ngay trong trình duyệt, không cần server.",
+  "main": "index.js",
+  "directories": {
+    "test": "tests"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/TranQuan289/pdf2md.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "bugs": {
+    "url": "https://github.com/TranQuan289/pdf2md/issues"
+  },
+  "homepage": "https://github.com/TranQuan289/pdf2md#readme",
+  "devDependencies": {
+    "@vitest/coverage-v8": "^4.1.6",
+    "jsdom": "^29.1.1",
+    "vitest": "^4.1.6"
+  }
+}

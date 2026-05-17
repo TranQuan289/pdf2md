@@ -58,6 +58,14 @@ main { padding: 14px 16px; }
 .label { color: #6b7280; flex-shrink: 0; }
 #filename, #status { word-break: break-all; flex: 1; }
 
+.hint {
+  font-size: 11px;
+  color: #9ca3af;
+  margin-top: 6px;
+  font-style: italic;
+  min-height: 0;
+}
+
 button#convert {
   width: 100%;
   padding: 9px;

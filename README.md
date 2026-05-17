@@ -35,6 +35,16 @@ Powered by **pdfplumber** (Python) running inside **Pyodide** (WebAssembly). Sam
 
 - Chrome 116 or later
 
+### Opening local PDF files (`file://`)
+
+To convert PDFs opened directly from your computer (e.g. `file:///Users/.../doc.pdf`):
+
+1. Go to `chrome://extensions/`
+2. Click **Details** on **PDF to MD**
+3. Toggle on **Allow access to file URLs**
+
+Without this, Chrome blocks the extension from reading local files and the popup will show an error.
+
 ### Bundle size
 
 ~22 MB. Breakdown:
@@ -103,6 +113,16 @@ Sử dụng **pdfplumber** (Python) chạy bên trong **Pyodide** (WebAssembly) 
 ### Yêu cầu
 
 - Chrome 116 trở lên
+
+### Mở file PDF từ máy tính (`file://`)
+
+Để chuyển đổi PDF mở trực tiếp từ máy (ví dụ `file:///Users/.../doc.pdf`):
+
+1. Mở `chrome://extensions/`
+2. Bấm **Details** (Chi tiết) trên **PDF to MD**
+3. Bật **Allow access to file URLs** (Cho phép truy cập URL tệp)
+
+Nếu không bật, Chrome sẽ chặn extension đọc file local và popup sẽ hiện lỗi.
 
 ### Giới hạn
 
