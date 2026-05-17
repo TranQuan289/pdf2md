@@ -1,11 +1,27 @@
+# Python
 __pycache__/
 *.py[cod]
 *.egg-info/
 .venv/
 .pytest_cache/
 .coverage
+
+# Node / Vitest
+node_modules/
+coverage/
+.nyc_output/
+
+# Build artifacts
 dist/
 build/
+
+# Vendored binary assets (Pyodide WASM, Python wheels, stdlib)
+# These are bundled into the Chrome extension zip for Web Store upload
+# but are too large (~22MB) to track in git.
+# Download script: (add link to your setup script here)
+extension-pyodide/lib/
+
+# OS
 .DS_Store
 
 # Auto-generated test fixtures (rebuilt via tests/fixtures/*.py)
@@ -27,3 +43,6 @@ tests/fixtures/real_world/*.md
 .windsurf/
 .vscode/
 .idea/
+
+# Release zips
+*.zip
